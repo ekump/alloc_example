@@ -1,0 +1,10 @@
+[package]
+name = "alloc_example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmp = { version = "0.8.14", default-features = false }
+serde = { version = "1.0.145", features = ["derive"] }
+rmp-serde = "1.1.1"
+serde_json = "1.0"
