@@ -5,12 +5,72 @@ use rmp::{decode, Marker};
 use rmp::decode::{DecodeStringError, RmpRead};
 use rmp_serde::encode::to_vec_named;
 use serde::Serialize;
+use bytes::Bytes;
+use std::borrow::Borrow;
 
 mod number;
 mod span_link;
 #[derive(Clone, Debug)]
-pub enum TracerPayloadCollection<'a> {
-    V04(Vec<Vec<Span<'a>>>),
+pub enum TracerPayloadCollection {
+    V04(Vec<Vec<Span>>),
+}
+
+struct BufferWrapper {
+    buffer: Bytes,
+}
+
+impl BufferWrapper {
+    pub fn new(buffer: Bytes) -> Self {
+        BufferWrapper { buffer }
+    }
+
+    pub fn create_my_string(&self, slice: &[u8]) -> MyString {
+        let start = slice.as_ptr() as usize - self.buffer.as_ptr() as usize;
+        let end = start + slice.len();
+
+        if end <= self.buffer.len() {
+            MyString::from_bytes(self.buffer.slice(start..end))
+        } else {
+            panic!("Calculated slice range is out of bounds");
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MyString {
+    bytes: Bytes,
+}
+
+impl MyString {
+    // Creates a MyString from a full slice (copies the data)
+    pub fn from_slice(slice: &[u8]) -> MyString {
+        MyString {
+            bytes: Bytes::copy_from_slice(slice),
+        }
+    }
+    // Creates a MyString from a Bytes instance (does not copy the data)
+    pub fn from_bytes(bytes: Bytes) -> MyString {
+        MyString { bytes }
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes).expect("Invalid UTF-8")
+    }
+
+}
+
+impl Default for MyString {
+    fn default() -> Self {
+        MyString {
+            bytes: Bytes::new(),
+        }
+    }
+}
+
+impl Borrow<str> for MyString {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
 }
 
 #[tokio::main]
@@ -21,64 +81,69 @@ async fn main() {
 
     let spans = vec![vec![span, span_2]];
     let payload = source_span_to_msgpack(&spans).unwrap();
+    println!("Payload: {:?}", payload);
+    let handle = sidecar_send_trace_v04_bytes(payload);
+    handle.await.unwrap(); // Wait for the trace flusher to complete
 
-    // necessary to block on sidecar_send_trace_v04_bytes while maintaining the libdatadog function signatures as best as possible.
-    tokio::task::block_in_place(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            sidecar_send_trace_v04_bytes(payload);
-        });
-    });
+
     println!("Exiting app");
 }
 
-// This function is intended to simulate the sidecar_server impl method send_trace_v04_bytes, which receives a Vec<u8> of msgpack data and calls sidecar_send_trace_v04 with a &[u8]. It can be considered "the entrypoint" after FFI.
-fn sidecar_send_trace_v04_bytes(data: Vec<u8>) {
+fn sidecar_send_trace_v04_bytes(data: Vec<u8>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        sidecar_send_trace_v04(data.as_slice());
-    });
+        let _ = sidecar_send_trace_v04(data).await;
+    })
 }
 
-// This function is intended to simulate the sidecar_server impl method send_trace_v04, which receives a &[u8] of msgpack data.
-fn sidecar_send_trace_v04(data: &[u8]) {
+fn sidecar_send_trace_v04(data: Vec<u8>) -> tokio::task::JoinHandle<()> {
+    let bytes = Bytes::from(data);
+    tokio::spawn(async move {
+        sidecar_send_trace_v04_inner(bytes).await;
+    })
+}
+
+async fn sidecar_send_trace_v04_inner(data: Bytes) {
     let trace_payload = msgpack_to_tracer_payload_collection(data).unwrap();
-    sidecar_trace_flusher_enqueue(trace_payload);
+    let handle = sidecar_trace_flusher_enqueue(trace_payload);
+    handle.await.unwrap();
 }
 
-// This function is intended to simulate the trace flusher.
-fn sidecar_trace_flusher_enqueue(trace_payload: TracerPayloadCollection) {
-    tokio::spawn(async move {
-        match trace_payload {
-            TracerPayloadCollection::V04(traces) => {
-                println!("Traces: {:?}", traces);
-            }
-        }
-    });
-}
-
-// This function is intended to simulate the public interface with tracer_payload. It is intended to replace the try_into with the TracerPayloadParams as that isn't neecessary anymore.
-fn msgpack_to_tracer_payload_collection<'a>(mut data: &'a [u8]) -> Result<TracerPayloadCollection<'a>, DecodeError> {
-    let traces = from_slice(&mut data)?;
+fn msgpack_to_tracer_payload_collection(data: Bytes) -> Result<TracerPayloadCollection, DecodeError> {
+    let traces = from_slice(data)?;
 
     Ok(TracerPayloadCollection::V04(traces))
 }
 
-fn from_slice<'a>(mut data: &'a [u8]) -> Result<Vec<Vec<Span<'a>>>, DecodeError> {
-    let trace_count = rmp::decode::read_array_len(&mut data).map_err(|_| {
+fn sidecar_trace_flusher_enqueue(trace_payload: TracerPayloadCollection) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
+        match trace_payload {
+            TracerPayloadCollection::V04(traces) => {
+                println!("In flusher: Traces: {:?}", traces);
+            }
+        }
+    });
+
+    handle
+}
+
+// This function is intended to simulate the public interface with tracer_payload. It is intended to replace the try_into with the TracerPayloadParams as that isn't neecessary anymore.
+fn from_slice(data: Bytes) -> Result<Vec<Vec<Span>>, DecodeError> {
+    let mut local_buf = data.as_ref();
+    let trace_count = rmp::decode::read_array_len(&mut local_buf).map_err(|_| {
         DecodeError::Generic("Unable to get array len for trace count".to_owned())
     })?;
 
-    let mut traces: Vec<Vec<Span<'a>>> = Default::default();
+    let mut traces: Vec<Vec<Span>> = Default::default();
 
     for _ in 0..trace_count {
-        let span_count = rmp::decode::read_array_len(&mut data).map_err(|_| {
+        let span_count = rmp::decode::read_array_len(&mut local_buf).map_err(|_| {
             DecodeError::Generic("Unable to get map len for span size".to_owned())
         })?;
 
-        let mut trace: Vec<Span<'a>> = Default::default();
+        let mut trace: Vec<Span> = Default::default();
 
         for _ in 0..span_count {
-            let span = decode_span(data)?;
+            let span = decode_span(&data, &mut local_buf)?;
             trace.push(span);
         }
         traces.push(trace);
@@ -87,22 +152,22 @@ fn from_slice<'a>(mut data: &'a [u8]) -> Result<Vec<Vec<Span<'a>>>, DecodeError>
     Ok(traces)
 }
 
-// Note: buf has to be a mutable reference to a reference to a slice of bytes for rmp.
-fn decode_span<'a>(mut buf: &'a [u8]) -> Result<Span<'a>, DecodeError> {
+fn decode_span<'a>(buffer: &'a Bytes, buf: &mut &'a [u8]) -> Result<Span, DecodeError> {
     let mut span = Span::default();
+    let wrapper = BufferWrapper::new(buffer.clone()); // Use the Bytes instance directly
 
-    let span_size = rmp::decode::read_map_len(&mut buf).map_err(|_| {
+    let span_size = rmp::decode::read_map_len(buf).map_err(|_| {
         DecodeError::Generic("Unable to get map len for span size".to_owned())
     })?;
 
     for _ in 0..span_size {
-        fill_span(&mut span, &mut buf)?;
+        fill_span(&mut span, &wrapper, buf)?;
     }
 
     Ok(span)
 }
 
-fn fill_span<'a>(span: &mut Span<'a>, buf: &mut &'a [u8]) -> Result<(), DecodeError> {
+fn fill_span(span: &mut Span, buf_wrapper: &BufferWrapper, buf: &mut &[u8]) -> Result<(), DecodeError> {
     let (key, value) = read_string_ref(buf)?;
     let key = key.parse::<SpanKey>()?;
 
@@ -110,18 +175,18 @@ fn fill_span<'a>(span: &mut Span<'a>, buf: &mut &'a [u8]) -> Result<(), DecodeEr
 
     match key {
         SpanKey::Service => {
-            let (value , next) = read_string_ref(buf)?;
-            span.service = Cow::Borrowed(value);
+            let (value, next) = read_string_ref(buf)?;
+            span.service = buf_wrapper.create_my_string(value.as_bytes());
             *buf = next;
-        }
+        },
         SpanKey::Name => {
-            let (value , next) = read_string_ref(buf)?;
-            span.name = Cow::Borrowed(value);
+            let (value, next) = read_string_ref(buf)?;
+            span.name = buf_wrapper.create_my_string(value.as_bytes());
             *buf = next;
-        }
+        },
         SpanKey::Resource => {
             let (value , next) = read_string_ref(buf)?;
-            span.resource = Cow::Borrowed(value);
+            span.resource = buf_wrapper.create_my_string(value.as_bytes());
             *buf = next;
         }
         SpanKey::TraceId => span.trace_id = number::read_number(buf)?.try_into()?,
@@ -130,23 +195,18 @@ fn fill_span<'a>(span: &mut Span<'a>, buf: &mut &'a [u8]) -> Result<(), DecodeEr
         SpanKey::Start => span.start = number::read_number(buf)?.try_into()?,
         SpanKey::Duration => span.duration = number::read_number(buf)?.try_into()?,
         SpanKey::Error => span.error = number::read_number(buf)?.try_into()?,
-        SpanKey::Meta => span.meta = read_map_strs(buf)?,
-        SpanKey::Metrics => span.metrics = read_metrics(buf)?,
         SpanKey::Type => {
             let (value , next) = read_string_ref(buf)?;
-            span.r#type = Cow::Borrowed(value);
+            span.r#type = buf_wrapper.create_my_string(value.as_bytes());
             *buf = next;
         }
-        SpanKey::MetaStruct => span.meta_struct = read_meta_struct(buf)?,
-        SpanKey::SpanLinks => span.span_links = span_link::read_span_links(buf)?,
+        _ => todo!(),
     }
     Ok(())
 }
 
-
 fn read_metrics<'a>(buf: &mut &'a [u8]) -> Result<HashMap<Cow<'a, str>, f64>, DecodeError> {
     let len = read_map_len(buf)?;
-    // read_map(len, buf, read_metric_pair)
     read_metric_pair(len, buf)
 }
 
@@ -154,7 +214,6 @@ fn read_meta_struct<'a>(buf: &mut &'a [u8]) -> Result<HashMap<Cow<'a, str>, Vec<
     let len = read_map_len(buf)?;
 
     let mut map = HashMap::new();
-    // read_map(len, buf, read_metric_pair)
 
     for _ in 0..len {
         let (k, v) = read_meta_struct_pair(len, buf)?;
@@ -294,21 +353,21 @@ impl FromStr for SpanKey {
 }
 
 #[derive(Clone, Debug, Default)]
-struct Span<'a> {
-   service:  Cow<'a, str>,
-    name: Cow<'a, str>,
-    resource: Cow<'a, str>,
-    r#type: Cow<'a, str>,
+struct Span {
+    service: MyString,
+    name: MyString,
+    resource: MyString,
+    r#type: MyString,
     trace_id: u64,
     span_id: u64,
     parent_id: u64,
     start: i64,
     duration: i64,
     error: i32,
-    meta: HashMap<Cow<'a, str>, Cow<'a, str>>,
-    metrics: HashMap<Cow<'a, str>, f64>,
-    meta_struct: HashMap<Cow<'a, str>, Vec<u8>>,
-    span_links: Vec<SpanLink<'a>>,
+    // meta: HashMap<Cow<'a, str>, Cow<'a, str>>,
+    // metrics: HashMap<Cow<'a, str>, f64>,
+    // meta_struct: HashMap<Cow<'a, str>, Vec<u8>>,
+    // span_links: Vec<SpanLink<'a>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -341,11 +400,11 @@ struct SourceSpan {
     start: i64,
     duration: i64,
     error: i32,
-    meta: HashMap<String, String>,
-    metrics: HashMap<String, f64>,
+    // meta: HashMap<String, String>,
+    // metrics: HashMap<String, f64>,
     r#type: String,
-    meta_struct: HashMap<String, Vec<u8>>,
-    span_links: Vec<SourceSpanLink>,
+    // meta_struct: HashMap<String, Vec<u8>>,
+    // span_links: Vec<SourceSpanLink>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -416,11 +475,11 @@ fn create_source_span() -> SourceSpan {
         start: 1625247600,
         duration: 1500,
         error: 0,
-        meta,
-        metrics,
+        // meta,
+        // metrics,
         r#type: "example_type".to_string(),
-        meta_struct,
-        span_links,
+        // meta_struct,
+        // span_links,
     }
 }
 
