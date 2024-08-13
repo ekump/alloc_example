@@ -13,22 +13,50 @@ pub enum TracerPayloadCollection<'a> {
     V04(Vec<Vec<Span<'a>>>),
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("Starting app");
     let span = create_source_span();
     let span_2 = create_source_span();
 
     let spans = vec![vec![span, span_2]];
     let payload = source_span_to_msgpack(&spans).unwrap();
-    sidecar_send_trace_v04(payload.as_slice());
+
+    // necessary to block on sidecar_send_trace_v04_bytes while maintaining the libdatadog function signatures as best as possible.
+    tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            sidecar_send_trace_v04_bytes(payload);
+        });
+    });
+    println!("Exiting app");
+}
+
+// This function is intended to simulate the sidecar_server impl method send_trace_v04_bytes, which receives a Vec<u8> of msgpack data and calls sidecar_send_trace_v04 with a &[u8]. It can be considered "the entrypoint" after FFI.
+fn sidecar_send_trace_v04_bytes(data: Vec<u8>) {
+    tokio::spawn(async move {
+        sidecar_send_trace_v04(data.as_slice());
+    });
 }
 
 // This function is intended to simulate the sidecar_server impl method send_trace_v04, which receives a &[u8] of msgpack data.
 fn sidecar_send_trace_v04(data: &[u8]) {
     let trace_payload = msgpack_to_tracer_payload_collection(data).unwrap();
-    println!("Payload decoded: {:?}", trace_payload);
+    sidecar_trace_flusher_enqueue(trace_payload);
 }
-// This function is inteded to simulate the public interface with tracer_payload. It is intended to replace the try_into with the TracerPayloadParams as that isn't neecessary anymore.
+
+// This function is intended to simulate the trace flusher.
+fn sidecar_trace_flusher_enqueue(trace_payload: TracerPayloadCollection) {
+    tokio::spawn(async move {
+        match trace_payload {
+            TracerPayloadCollection::V04(traces) => {
+                println!("Traces: {:?}", traces);
+            }
+        }
+    });
+}
+
+// This function is intended to simulate the public interface with tracer_payload. It is intended to replace the try_into with the TracerPayloadParams as that isn't neecessary anymore.
 fn msgpack_to_tracer_payload_collection<'a>(mut data: &'a [u8]) -> Result<TracerPayloadCollection<'a>, DecodeError> {
     let traces = from_slice(&mut data)?;
 
@@ -40,8 +68,6 @@ fn from_slice<'a>(mut data: &'a [u8]) -> Result<Vec<Vec<Span<'a>>>, DecodeError>
         DecodeError::Generic("Unable to get array len for trace count".to_owned())
     })?;
 
-    println!("Trace count: {}", trace_count);
-
     let mut traces: Vec<Vec<Span<'a>>> = Default::default();
 
     for _ in 0..trace_count {
@@ -49,12 +75,10 @@ fn from_slice<'a>(mut data: &'a [u8]) -> Result<Vec<Vec<Span<'a>>>, DecodeError>
             DecodeError::Generic("Unable to get map len for span size".to_owned())
         })?;
 
-        println!("Span count: {}", span_count);
         let mut trace: Vec<Span<'a>> = Default::default();
 
         for _ in 0..span_count {
             let span = decode_span(data)?;
-            println!("Span: {:?}", span);
             trace.push(span);
         }
         traces.push(trace);
@@ -170,7 +194,6 @@ fn read_metric_pair<'a>(len: usize, buf: &mut &'a [u8]) -> Result<HashMap<Cow<'a
 
 fn read_map_strs<'a>(buf: &mut &'a [u8]) -> Result<HashMap<Cow<'a, str>, Cow<'a, str>>, DecodeError> {
     let len = read_map_len(buf)?;
-    // read_map(len, buf, read_str_pair)
     read_str_pair(len, buf)
 }
 
@@ -186,14 +209,6 @@ fn read_str_pair<'a>(len: usize, buf: &mut &'a [u8]) -> Result<HashMap<Cow<'a, s
     }
     Ok(map)
 }
-
-// #[inline]
-// fn read_str_pair(buf: &mut &[u8]) -> Result<(String, String), DecodeError> {
-//     let k = read_string(buf)?;
-//     let v = read_string(buf)?;
-//
-//     Ok((k, v))
-// }
 
 fn read_map_len(buf: &mut &[u8]) -> Result<usize, DecodeError> {
     match decode::read_marker(buf)
@@ -213,7 +228,6 @@ fn read_map_len(buf: &mut &[u8]) -> Result<usize, DecodeError> {
         )),
     }
 }
-
 
 #[inline]
 fn read_string_ref(buf: &[u8]) -> Result<(&str, &[u8]), DecodeError> {
